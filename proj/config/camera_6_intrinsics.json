@@ -1,0 +1,47 @@
+{
+  "camera_matrix": [
+    [
+      1470.4395530530767,
+      0.0,
+      954.8889309604166
+    ],
+    [
+      0.0,
+      1467.514464749311,
+      538.980392409296
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "distortion": [
+    0.08934117143445593,
+    -0.058977454531476674,
+    -0.0002841481505900261,
+    -0.000756754268415985,
+    -0.19874890180012217
+  ],
+  "image_size_wh": [
+    1920,
+    1080
+  ],
+  "rms_reprojection_error_px": 0.1952911436538728,
+  "valid_images": [
+    "frame_017.png",
+    "frame_018.png",
+    "frame_023.png",
+    "frame_034.png",
+    "frame_051.png"
+  ],
+  "board_inner_corners_columns": 10,
+  "board_inner_corners_rows": 11,
+  "square_size_m": 0.08,
+  "four_corner_indices": [
+    0,
+    9,
+    109,
+    100
+  ]
+}
