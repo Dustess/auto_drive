@@ -1,0 +1,297 @@
+"""LiDAR 点云与聚类框的相机投影和绘制函数。"""
+
+import itertools
+import math
+import time
+
+import cv2
+import numpy as np
+import rospy
+import tf.transformations
+from sensor_msgs import point_cloud2
+from visualization_msgs.msg import Marker
+
+
+class LidarProjectionMixin:
+    def _read_lidar_points(self, cloud_msg):
+        """从 PointCloud2 读取 xyz；通过 stride 均匀抽取以限制每帧最大点数。"""
+        total = int(cloud_msg.width) * int(cloud_msg.height)
+        stride = max(1, int(math.ceil(float(total) / self.max_points)))
+        points = list(
+            itertools.islice(
+                point_cloud2.read_points(
+                    cloud_msg,
+                    field_names=("x", "y", "z"),
+                    skip_nans=True,
+                ),
+                0,
+                None,
+                stride,
+            )
+        )
+        if not points:
+            return np.empty((0, 3), dtype=np.float64)
+        return np.asarray(points, dtype=np.float64).reshape(-1, 3)
+
+    def _lidar_to_camera(self, camera_index, points_lidar):
+        """撤销 lidar_process 的平移（可选），再应用标定的 LiDAR 到相机外参。"""
+        points_calibration_frame = points_lidar
+        if self.undo_lidar_preprocessing:
+            # 当前 lidar_process.py 的 debug_flag=1：不旋转，只执行
+            # p_cloud = p_lidar + lidar_offset，所以逆操作是减去同一个 offset。
+            points_calibration_frame = points_lidar - self.cloud_frame_translation
+        model = self.camera_models[camera_index]
+        return (
+            points_calibration_frame @ model["rotation_camera_from_lidar"].T
+            + model["translation_camera_from_lidar"]
+        )
+
+    @staticmethod
+    def _project_camera_points(points_camera, camera_matrix, distortion):
+        """用 OpenCV 相机模型将相机坐标 (米) 投影到图像像素坐标。"""
+        projected, _ = cv2.projectPoints(
+            points_camera.reshape(-1, 1, 3),
+            np.zeros(3, dtype=np.float64),
+            np.zeros(3, dtype=np.float64),
+            camera_matrix,
+            distortion,
+        )
+        return projected.reshape(-1, 2)
+
+    def _draw_cloud(self, image, camera_index, cloud_msg, camera_matrix, distortion, timings=None):
+        """绘制点云；同一 LiDAR 帧复用时缓存相机投影，避免重复变换和投影。"""
+        height, width = image.shape[:2]
+        stamp = cloud_msg.header.stamp
+        model = self.camera_models[camera_index]
+        cache_key = (
+            camera_index,
+            int(stamp.secs),
+            int(stamp.nsecs),
+            cloud_msg.header.frame_id,
+            width,
+            height,
+            camera_matrix.shape,
+            camera_matrix.tobytes(),
+            distortion.shape,
+            distortion.tobytes(),
+            model["rotation_camera_from_lidar"].tobytes(),
+            model["translation_camera_from_lidar"].tobytes(),
+            self.undo_lidar_preprocessing,
+            self.cloud_frame_translation.tobytes(),
+            self.min_depth_m, self.max_depth_m, self.max_points,
+        )
+        cached = self.projected_cloud_cache.get(cache_key)
+        if timings is not None:
+            timings.update(projection_cache_hit=cached is not None,
+                           cloud_convert_ms=0.0, project_calculation_ms=0.0)
+        if cached is None:
+            total_points, pixels, colors, order = self._project_cloud_for_image(
+                cloud_msg,
+                camera_index,
+                width,
+                height,
+                camera_matrix,
+                distortion,
+                timings=timings,
+            )
+            self.projected_cloud_cache[cache_key] = (
+                total_points,
+                pixels,
+                colors,
+                order,
+            )
+            while len(self.projected_cloud_cache) > self.projected_cloud_cache_size:
+                self.projected_cloud_cache.popitem(last=False)
+        else:
+            self.projected_cloud_cache.move_to_end(cache_key)
+            total_points, pixels, colors, order = cached
+
+        draw_started = time.perf_counter()
+        for index in order:
+            u, v = pixels[index]
+            cv2.circle(
+                image,
+                (int(u), int(v)),
+                self.point_radius_px,
+                tuple(int(value) for value in colors[index]),
+                thickness=-1,
+                lineType=cv2.LINE_AA,
+            )
+        if timings is not None:
+            timings.update(cloud_draw_ms=(time.perf_counter() - draw_started) * 1000.0,
+                           total_points=total_points, projected_points=int(pixels.shape[0]))
+        return total_points, int(pixels.shape[0])
+
+    def _project_cloud_for_image(
+        self, cloud_msg, camera_index, width, height, camera_matrix, distortion, timings=None
+    ):
+        """分别计时点云转换与投影计算；命中路径不调用本方法。"""
+        started = time.perf_counter()
+        points_lidar = self._read_lidar_points(cloud_msg)
+        if timings is not None:
+            timings["cloud_convert_ms"] = (time.perf_counter() - started) * 1000.0
+        started = time.perf_counter()
+        try:
+            return self._project_lidar_points(points_lidar, camera_index, width, height,
+                                              camera_matrix, distortion)
+        finally:
+            if timings is not None:
+                timings["project_calculation_ms"] = (time.perf_counter() - started) * 1000.0
+
+    def _project_lidar_points(self, points_lidar, camera_index, width, height, camera_matrix, distortion):
+        if points_lidar.size == 0:
+            return (
+                0,
+                np.empty((0, 2), dtype=np.int32),
+                np.empty((0, 3), dtype=np.uint8),
+                np.empty((0,), dtype=np.int64),
+            )
+
+        points_camera = self._lidar_to_camera(camera_index, points_lidar)
+        depth = points_camera[:, 2]
+        valid = (
+            np.isfinite(points_camera).all(axis=1)
+            & (depth >= self.min_depth_m)
+            & (depth <= self.max_depth_m)
+        )
+        points_camera = points_camera[valid]
+        depth = depth[valid]
+        if points_camera.size == 0:
+            return (
+                len(points_lidar),
+                np.empty((0, 2), dtype=np.int32),
+                np.empty((0, 3), dtype=np.uint8),
+                np.empty((0,), dtype=np.int64),
+            )
+
+        pixels = self._project_camera_points(points_camera, camera_matrix, distortion)
+        in_image = (
+            np.isfinite(pixels).all(axis=1)
+            & (pixels[:, 0] >= 0)
+            & (pixels[:, 0] < width)
+            & (pixels[:, 1] >= 0)
+            & (pixels[:, 1] < height)
+        )
+        pixels = pixels[in_image].astype(np.int32)
+        depth = depth[in_image]
+        if pixels.size == 0:
+            return (
+                len(points_lidar),
+                pixels,
+                np.empty((0, 3), dtype=np.uint8),
+                np.empty((0,), dtype=np.int64),
+            )
+
+        # 先绘制远处的点，使近处的点最后绘制并保持可见。
+        order = np.argsort(depth)[::-1]
+        color_values = np.clip(
+            depth / self.max_depth_m * 255.0, 0, 255
+        ).astype(np.uint8)
+        colors = cv2.applyColorMap(
+            color_values.reshape(-1, 1), cv2.COLORMAP_JET
+        ).reshape(-1, 3)
+        return len(points_lidar), pixels, colors, order
+
+    @staticmethod
+    def _marker_corners_lidar(marker):
+        """根据 CUBE Marker 的尺寸、姿态和中心位置，计算 LiDAR 坐标系下的八个角点。"""
+        sx, sy, sz = marker.scale.x, marker.scale.y, marker.scale.z
+        if min(sx, sy, sz) <= 0.0:
+            return np.empty((0, 3), dtype=np.float64)
+        half = np.asarray([sx, sy, sz], dtype=np.float64) * 0.5
+        corners = np.asarray(
+            [
+                [-half[0], -half[1], -half[2]],
+                [ half[0], -half[1], -half[2]],
+                [ half[0],  half[1], -half[2]],
+                [-half[0],  half[1], -half[2]],
+                [-half[0], -half[1],  half[2]],
+                [ half[0], -half[1],  half[2]],
+                [ half[0],  half[1],  half[2]],
+                [-half[0],  half[1],  half[2]],
+            ],
+            dtype=np.float64,
+        )
+        q = marker.pose.orientation
+        quat = np.asarray([q.x, q.y, q.z, q.w], dtype=np.float64)
+        if np.linalg.norm(quat) < 1e-9:
+            quat = np.asarray([0.0, 0.0, 0.0, 1.0])
+        rotation = tf.transformations.quaternion_matrix(quat)[:3, :3]
+        center = np.asarray(
+            [marker.pose.position.x, marker.pose.position.y, marker.pose.position.z],
+            dtype=np.float64,
+        )
+        return corners @ rotation.T + center
+
+    def _draw_bboxes(
+        self, image, camera_index, marker_array, camera_matrix, distortion
+    ):
+        """将 MarkerArray 中的立方体框投影为绿色线框，并标出聚类 ID。"""
+        height, width = image.shape[:2]
+        edges = (
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        )
+        projected_boxes = []
+        for marker in marker_array.markers:
+            if marker.action not in (Marker.ADD, Marker.MODIFY) or marker.type != Marker.CUBE:
+                continue
+            corners_lidar = self._marker_corners_lidar(marker)
+            if corners_lidar.shape != (8, 3):
+                continue
+            corners_camera = self._lidar_to_camera(camera_index, corners_lidar)
+            pixels = self._project_camera_points(corners_camera, camera_matrix, distortion)
+
+            visible = (
+                (corners_camera[:, 2] > self.min_depth_m)
+                & np.isfinite(pixels).all(axis=1)
+            )
+            visible_pixels = pixels[visible]
+            if visible_pixels.size:
+                x_min = float(np.min(visible_pixels[:, 0]))
+                y_min = float(np.min(visible_pixels[:, 1]))
+                x_max = float(np.max(visible_pixels[:, 0]))
+                y_max = float(np.max(visible_pixels[:, 1]))
+                if x_max >= 0 and y_max >= 0 and x_min < width and y_min < height:
+                    x1 = int(np.clip(math.floor(x_min), 0, width - 1))
+                    y1 = int(np.clip(math.floor(y_min), 0, height - 1))
+                    x2 = int(np.clip(math.ceil(x_max), 0, width - 1))
+                    y2 = int(np.clip(math.ceil(y_max), 0, height - 1))
+                    if x2 > x1 and y2 > y1:
+                        projected_boxes.append((int(marker.id), (x1, y1, x2, y2)))
+
+            for start, end in edges:
+                p0 = corners_camera[start]
+                p1 = corners_camera[end]
+                if p0[2] <= self.min_depth_m or p1[2] <= self.min_depth_m:
+                    continue
+                u0, v0 = pixels[start]
+                u1, v1 = pixels[end]
+                if not np.isfinite([u0, v0, u1, v1]).all():
+                    continue
+                cv2.line(
+                    image,
+                    (int(round(u0)), int(round(v0))),
+                    (int(round(u1)), int(round(v1))),
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+            if np.any(visible):
+                center_px = np.mean(pixels[visible], axis=0)
+                if np.isfinite(center_px).all():
+                    u = int(np.clip(round(center_px[0]), 0, width - 1))
+                    v = int(np.clip(round(center_px[1]), 0, height - 1))
+                    cv2.putText(
+                        image,
+                        "cluster %d" % marker.id,
+                        (u, v),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (0, 255, 0),
+                        2,
+                        cv2.LINE_AA,
+                    )
+        return projected_boxes

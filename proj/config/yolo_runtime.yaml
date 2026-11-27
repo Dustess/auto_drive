@@ -1,0 +1,28 @@
+# 加载到节点私有命名空间：rosparam load proj/config/yolo_runtime.yaml /project_bbox_node
+# 相机编号为 1..6；设 [] 可做关闭投影的基线对比。
+projection_cameras: [1, 6]
+
+# 从收到图像回调开始计算任务期限；0 表示禁用期限丢弃。
+# 各阶段开始及发布前检查，不会强制中断已开始的推理/投影。
+max_output_age_sec: 0.5
+
+monitor_topic: /fusion/performance
+monitor_interval_sec: 1.0
+monitor_window_sec: 5.0
+# 0 仅关闭终端监控日志，ROS JSON 话题继续发布。
+monitor_log_interval_sec: 2.0
+
+# Jetson 自动查找 GPU sysfs load；找不到时尝试 nvidia-smi。
+# 如板端路径不同，请填实际可读的 load 文件；原始值乘 scale 得到百分比。
+gpu_load_path: ""
+gpu_load_scale: 0.1
+
+# 保留原图像时间戳，便于检测与图像关联。
+output_stamp_with_system_time: false
+max_lidar_age_sec: 0.30
+bbox_slop_sec: 0.10
+projected_cloud_cache_size: 16
+
+# 模型路径、六路输入输出话题及标定文件沿用现有默认值或原 launch 配置。
+# 新增纯 YOLO 检测话题默认为每一路 output_detections_topics 后追加 /yolo。
+# ~inference_queue_size 已停用，各阶段每路容量固定为 1。
